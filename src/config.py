@@ -5,7 +5,10 @@ import torch
 try:
     from generative_recommenders.modeling.sequential.hstu import HSTUConfig
 except ImportError:
-    HSTUConfig = None
+    try:
+        from research_hstu.modeling.sequential.hstu import HSTUConfig
+    except ImportError:
+        HSTUConfig = None
 
 @dataclass
 class UniGCRConfig:
@@ -45,7 +48,7 @@ class UniGCRConfig:
     patience: int = 3
     batch_size: int = 64
     lr: float = 1e-3
-    epochs: int = 50
+    epochs: int = 50 #50
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 42
     
@@ -73,5 +76,5 @@ class UniGCRConfig:
             normalization="layer_norm",
             activation="silu",
             max_seq_len=self.max_seq_len,
-            attn_alpha=self.attn_alpha 
+            attn_alpha=self.attn_alpha
         )

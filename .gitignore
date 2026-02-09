@@ -1,0 +1,44 @@
+############################
+# IDE / Editor
+############################
+.idea/
+.vscode/
+
+############################
+# Python
+############################
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+############################
+# Training outputs
+############################
+checkpoints/
+logs/
+runs/
+
+############################
+# Large / raw data (DO NOT COMMIT)
+############################
+data/Amazon raw beauty/
+data/Amazon_raw/
+data/raw/
+data/original/
+
+############################
+# System / environment
+############################
+*.deb
+*.swp
+.DS_Store
+
+############################
+# Optional: virtual env (if any)
+############################
+.venv/
+venv/
+env/
+
+

@@ -5,6 +5,50 @@ import deepspeed
 import json
 import numpy as np
 from .utils import is_main_process
+import math
+
+def compute_gr_metrics(candidates, target_items, grid_mapper, topk):
+    """
+    candidates: (B, K, L)
+    targets:    (B, L)
+    """
+    B, K, L = candidates.shape
+    pred_items = []
+    for b in range(B):
+        items = []
+        for i in range(K):
+            code_tuple = tuple(candidates[b, i].tolist())
+            item_id = grid_mapper.codes_to_item(code_tuple)
+            if item_id is not None:
+                items.append(item_id)
+        pred_items.append(items)
+    batch_hit, batch_ndcg = compute_item_level_metrics(pred_items, target_items, topk)
+    return batch_hit, batch_ndcg
+
+
+def compute_item_level_metrics(pred_items, target_items, k):
+    """
+    pred_items:   List[List[int]]  (B, K)
+    target_items: Tensor/List      (B,)
+    """
+    if hasattr(target_items, "tolist"):
+        target_items = target_items.tolist()
+
+    hits = []
+    ndcgs = []
+
+    for preds, tgt in zip(pred_items, target_items):
+        preds = preds[:k]
+
+        if tgt in preds:
+            hits.append(1.0)
+            rank = preds.index(tgt)  # 0-based
+            ndcgs.append(1.0 / math.log2(rank + 2))
+        else:
+            hits.append(0.0)
+            ndcgs.append(0.0)
+
+    return sum(hits) / len(hits), sum(ndcgs) / len(ndcgs)
 
 class UniGCRTrainer:
     def __init__(self, config, args, model, train_loader, val_loader=None):
@@ -15,32 +59,19 @@ class UniGCRTrainer:
         
         # --- Loss Definitions ---
         # GR 任务: 预测下一个 Semantic Code (Cross Entropy)
-        self.gr_criterion = nn.CrossEntropyLoss()
+        # ignore_index=0 会自动忽略 target 中值为 0 的位置
+        self.gr_criterion = nn.CrossEntropyLoss(ignore_index=0)
         
         # CTR 任务: 联合 Loss
         if config.enable_ctr:
             self.bce_loss = nn.BCEWithLogitsLoss()
             self.ce_loss = nn.CrossEntropyLoss()
-            
-        # --- DeepSpeed Initialization ---
-        ds_config = None
-        if hasattr(args, 'deepspeed_config') and args.deepspeed_config:
-            try:
-                with open(args.deepspeed_config, 'r') as f:
-                    ds_config = json.load(f)
-                if is_main_process():
-                    print(f"[Trainer] Loaded DeepSpeed config from {args.deepspeed_config}")
-            except Exception as e:
-                print(f"[Trainer] Error loading DS config: {e}")
-                
-        # 初始化 DeepSpeed Engine
-        self.model_engine, self.optimizer, _, _ = deepspeed.initialize(
-            args=args, 
-            model=model, 
-            model_parameters=model.parameters(), 
-            config=ds_config, 
-            dist_init_required=True
-        )
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = model.to(self.device)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.lr)
+        self.model_engine = self.model
+
 
     def calculate_ctr_loss(self, ctr_logits, ctr_labels):
         """
@@ -61,7 +92,7 @@ class UniGCRTrainer:
         完整的训练 Epoch 逻辑
         """
         self.model_engine.train()
-        
+
         # 仅主进程显示进度条
         if is_main_process():
             pbar = tqdm(self.train_loader, desc=f"Epoch {epoch_idx}")
@@ -82,27 +113,37 @@ class UniGCRTrainer:
         for batch in pbar:
             # 1. 将 Batch 数据移动到 GPU
             batch = {
-                k: v.to(self.model_engine.device) 
-                for k, v in batch.items() 
+                # k: v.to(self.model_engine.device)
+                k: v.to(self.device)
+                for k, v in batch.items()
                 if isinstance(v, torch.Tensor)
             }
             
             self.model_engine.zero_grad()
-            
+
             # 2. Forward Pass (Shared Backbone & GR Head)
-            # u: User State (B, D)
-            # gr_logits: (B, Vocab) - Next Token Prediction Logits
-            u, gr_logits = self.model_engine(batch)
-            
+            # u_last: (B, D) - 用于 CTR 和 Beam Search
+            # u_history: (B, L-1, D) - 用于 GR 训练
+            # gr_logits: (B, L-1, V) - Sequence-level Prediction Logits
+            u_last, u_history, gr_logits, B = self.model_engine(batch)
+
             loss = 0.0
             
             # --- Task A: Generative Retrieval (GR) ---
             if self.config.use_semantic_seq:
-                # Target: Flattened Semantic Sequence
-                # shape: (B * Layers)
-                target_flat = batch['sem_target'].view(-1)
-                loss_gr = self.gr_criterion(gr_logits, target_flat)
-                
+                # Target: Flattened Semantic Sequence (shifted by 1)
+                # sem_target shape: (B, L-1) —— 对齐 gr_logits
+                sem_target = batch['sem_target'] # (B, L-1)
+
+                # Flatten for CrossEntropy
+                # logits: (B, L-1, V) -> (B*(L-1), V)
+                # target: (B, L-1) -> (B*(L-1),)
+                logits_flat = gr_logits.view(-1, gr_logits.size(-1))
+                target_flat = sem_target.view(-1)
+
+                # CrossEntropyLoss(ignore_index=0) 会自动忽略 padding
+                loss_gr = self.gr_criterion(logits_flat, target_flat)
+
                 loss += loss_gr
                 gr_loss_sum += loss_gr.item()
             
@@ -110,18 +151,22 @@ class UniGCRTrainer:
             loss_ctr_val = 0.0
             if self.config.enable_ctr:
                 # 获取原始模型 (DeepSpeed wrap 了 module)
-                real_model = self.model_engine.module if hasattr(self.model_engine, 'module') else self.model_engine
-                
+                # real_model = self.model_engine.module if hasattr(self.model_engine, 'module') else self.model_engine
+                real_model = self.model
+
                 # 正样本: 用户实际点击的 Item 的 Semantic Codes
                 # shape: (B, Layers)
                 pos_codes = batch['ctr_pos_codes']
                 
                 # 调用 predict_ctr
                 # 注意: 内部包含 Beam Search 逻辑，需要传入 batch (获取 History) 和 mapper
+                # ctr_logits, ctr_labels = real_model.predict_ctr(
+                #     u, batch, pos_codes, self.model_engine.device, grid_mapper
+                # )
                 ctr_logits, ctr_labels = real_model.predict_ctr(
-                    u, batch, pos_codes, self.model_engine.device, grid_mapper
+                    u_last, batch, pos_codes, self.device, grid_mapper
                 )
-                
+
                 # 计算 Loss
                 loss_ctr = self.calculate_ctr_loss(ctr_logits, ctr_labels)
                 
@@ -130,9 +175,11 @@ class UniGCRTrainer:
                 ctr_loss_sum += loss_ctr_val
 
             # 3. Backward & Step (DeepSpeed)
-            self.model_engine.backward(loss)
-            self.model_engine.step()
-            
+            # self.model_engine.backward(loss)
+            # self.model_engine.step()
+            loss.backward()
+            self.optimizer.step()
+
             total_loss += loss.item()
             
             # 更新进度条
@@ -166,7 +213,8 @@ class UniGCRTrainer:
         if not self.val_loader: return {}
         
         self.model_engine.eval()
-        device = self.model_engine.device
+        # device = self.model_engine.device
+        device = self.device
         grid_mapper = self.val_loader.dataset.grid_mapper
         
         # 统计变量 (用于 Loss 计算)
@@ -184,26 +232,31 @@ class UniGCRTrainer:
         all_ctr_labels = []
 
         iterator = tqdm(self.val_loader, desc="Eval") if is_main_process() else self.val_loader
-        real_model = self.model_engine.module if hasattr(self.model_engine, 'module') else self.model_engine
+        # real_model = self.model_engine.module if hasattr(self.model_engine, 'module') else self.model_engine
+        real_model = self.model
 
         for batch in iterator:
             batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
             
             # --- A. 计算 Validation Loss ---
             # 1. Forward
-            u, gr_logits = self.model_engine(batch)
-            
-            # 2. GR Val Loss
+            u_last, u_history, gr_logits, B = self.model_engine(batch)
+
+            # 2. GR Val Loss (Sequence-level)
             if self.config.use_semantic_seq:
-                loss_gr = self.gr_criterion(gr_logits, batch['sem_target'].view(-1))
+                sem_target = batch['sem_target']  # (B, L-1)
+
+                logits_flat = gr_logits.view(-1, gr_logits.size(-1))
+                target_flat = sem_target.view(-1)
+                loss_gr = self.gr_criterion(logits_flat, target_flat)
                 val_gr_loss_sum += loss_gr.item()
-                
+
             # 3. CTR Val Loss & Logits Collection
             if self.config.enable_ctr:
                 # 在 Eval 阶段，predict_ctr 内部依然会做 Beam Search 生成负样本
                 # 这保证了 Loss 的计算方式与训练一致
                 ctr_logits, ctr_labels = real_model.predict_ctr(
-                    u, batch, batch['ctr_pos_codes'], device, grid_mapper
+                    u_last, batch, batch['ctr_pos_codes'], device, grid_mapper
                 )
                 
                 loss_ctr, _, _ = self.calculate_ctr_loss(ctr_logits, ctr_labels)
@@ -216,42 +269,83 @@ class UniGCRTrainer:
             # --- B. 计算 GR Ranking Metrics (Hit/NDCG) ---
             # 这部分需要 Beam Search 生成，比较耗时
             # 如果只为了 Early Stop (Loss based)，可以跳过这步，但为了监控指标还是加上
+            # Beam Search 依然使用 u_last 作为起点
+            # candidates = real_model.generate_gr_candidates(
+            #     batch_dict=batch,
+            #     u_last=u_last,
+            #     beam_width=topk,
+            #     grid_mapper=grid_mapper
+            # )
+
+            # 使用纯净的 history 进行 beam search
+            # 构造一个干净的 batch_dict 用于生成
+            eval_batch = {'sem_history': batch['sem_history_eval']}
+
+            # 需要重新计算 u_last（基于纯净 history）
+            with torch.no_grad():
+                # 临时 forward 只为获取 u_last
+                x = real_model.input_layer(eval_batch)
+                B_eval, L_eval, _ = x.shape
+                lengths_eval = (eval_batch['sem_history'] != 0).sum(dim=1)
+                u_seq_eval = real_model.backbone(
+                    past_lengths=lengths_eval,
+                    past_ids=torch.zeros((B_eval, L_eval), dtype=torch.long, device=device),
+                    past_embeddings=x,
+                    past_payloads={}
+                )
+                u_last_eval = u_seq_eval[torch.arange(B_eval, device=device), lengths_eval - 1]
+
             candidates = real_model.generate_gr_candidates(
-                batch, k=topk, grid_mapper=grid_mapper
+                batch_dict=eval_batch,
+                u_last=u_last_eval,
+                beam_width=topk,
+                grid_mapper=grid_mapper
             )
-            
-            # 计算当前 batch 的平均 Hit/NDCG
-            # 注意: target_eval 是原始 Item Codes，不是 flattened
-            batch_hit, batch_ndcg = compute_gr_metrics(
-                candidates, batch['sem_target_eval'], grid_mapper, k=topk
-            )
-            
+
+            batch_hit, batch_ndcg = compute_gr_metrics(candidates, batch['target_item'], grid_mapper, topk)
             all_hit_sums += batch_hit * batch['sem_target_eval'].size(0)
             all_ndcg_sums += batch_ndcg * batch['sem_target_eval'].size(0)
             all_gr_count += batch['sem_target_eval'].size(0)
 
-        # --- 汇总结果 ---
+        # # --- 汇总结果 ---
         num_batches = len(self.val_loader)
-        
+
         # 1. Loss 汇总 (Mean across batches)
         # 简单平均即可，不需要 gather (因为 DP 每个卡数据量差不多)
         avg_gr_loss = val_gr_loss_sum / num_batches
         avg_ctr_loss = val_ctr_loss_sum / num_batches
-        
+
         # 2. GR Metrics 汇总 (AllReduce)
         # 转 Tensor
-        gr_stats = torch.tensor([all_hit_sums, all_ndcg_sums, all_gr_count], device=device)
-        torch.distributed.all_reduce(gr_stats, op=torch.distributed.ReduceOp.SUM)
-        
-        final_hit = gr_stats[0] / gr_stats[2] if gr_stats[2] > 0 else 0.0
-        final_ndcg = gr_stats[1] / gr_stats[2] if gr_stats[2] > 0 else 0.0
-        
+        # gr_stats = torch.tensor([all_hit_sums, all_ndcg_sums, all_gr_count], device=device)
+        # torch.distributed.all_reduce(gr_stats, op=torch.distributed.ReduceOp.SUM)
+        #
+        # final_hit = gr_stats[0] / gr_stats[2] if gr_stats[2] > 0 else 0.0
+        # final_ndcg = gr_stats[1] / gr_stats[2] if gr_stats[2] > 0 else 0.0
+
+        # --- 汇总 GR ranking metrics（如果你真的算了的话） ---
+        final_hit = 0.0
+        final_ndcg = 0.0
+
+        if all_gr_count > 0:
+            final_hit = all_hit_sums / all_gr_count
+            final_ndcg = all_ndcg_sums / all_gr_count
+
+        # 只有在分布式已初始化时，才需要 all_reduce 汇总
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            gr_stats = torch.tensor([all_hit_sums, all_ndcg_sums, all_gr_count], device=device)
+            torch.distributed.all_reduce(gr_stats, op=torch.distributed.ReduceOp.SUM)
+            final_hit = (gr_stats[0] / gr_stats[2]).item() if gr_stats[2] > 0 else 0.0
+            final_ndcg = (gr_stats[1] / gr_stats[2]).item() if gr_stats[2] > 0 else 0.0
+        else:
+            final_hit = float(final_hit)
+            final_ndcg = float(final_ndcg)
+
         results = {
             'val_gr_loss': avg_gr_loss,
-            'Hit@10': final_hit.item(),
-            'NDCG@10': final_ndcg.item()
+            'Hit@10': final_hit,
+            'NDCG@10': final_ndcg
         }
-        
         # 3. CTR Metrics 汇总 (Gather & Sklearn)
         if self.config.enable_ctr and len(all_ctr_logits) > 0:
             local_logits = torch.cat(all_ctr_logits)
@@ -272,7 +366,18 @@ class UniGCRTrainer:
 
     def save(self, tag):
         """保存 Checkpoint"""
-        self.model_engine.save_checkpoint(save_dir="checkpoints", tag=tag)
+        # self.model_engine.save_checkpoint(save_dir="checkpoints", tag=tag)
+        # self.model.save_checkpoint(save_dir="checkpoints", tag=tag)
+        import os
+        os.makedirs("checkpoints", exist_ok=True)
+        path = os.path.join("checkpoints", f"{tag}.pt")
+        torch.save({
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "config": vars(self.config) if hasattr(self.config, "__dict__") else self.config,
+        }, path)
+        if is_main_process():
+            print(f"[Save] checkpoint saved to {path}")
 
     def train(self):
         # Early Stopping 策略设置
@@ -312,9 +417,16 @@ class UniGCRTrainer:
                 else:
                     log_str += "| "
                 
-                log_str += f"Eval: "
-                log_str += f"Hit@10={eval_metrics['Hit@10']:.4f} NDCG@10={eval_metrics['NDCG@10']:.4f} GR_Loss={eval_metrics['val_gr_loss']:.4f} "
-                
+                # log_str += f"Eval: "
+                # log_str += f"Hit@10={eval_metrics['Hit@10']:.4f} NDCG@10={eval_metrics['NDCG@10']:.4f} GR_Loss={eval_metrics['val_gr_loss']:.4f} "
+                log_str += "Eval: "
+                log_str += f"GR_Loss={eval_metrics.get('val_gr_loss', 0):.4f} "
+
+                if 'Hit@10' in eval_metrics:
+                    log_str += f"Hit@10={eval_metrics['Hit@10']:.4f} "
+                if 'NDCG@10' in eval_metrics:
+                    log_str += f"NDCG@10={eval_metrics['NDCG@10']:.4f} "
+
                 if self.config.enable_ctr:
                     log_str += f"AUC={eval_metrics.get('AUC',0):.4f} LogLoss={eval_metrics.get('LogLoss',0):.4f}"
                 
