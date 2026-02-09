@@ -275,14 +275,7 @@ class UniGCRModel(nn.Module):
         # 普通的前向传播 (Training GR)
         sem_history = batch_dict["sem_history"]
 
-        # HSTU-style teacher forcing: append last target token but keep lengths as history.
         lengths = self.get_lengths(sem_history)
-        if self.training and "sem_target" in batch_dict:
-            sem_target = batch_dict["sem_target"]
-            # append last target token to form full_seq (L = history + 1)
-            sem_history_full = torch.cat([sem_history, sem_target[:, -1:].contiguous()], dim=1)
-            batch_dict["sem_history"] = sem_history_full
-
         x = self.input_layer(batch_dict)
         B, L, _ = x.shape
 
@@ -293,18 +286,13 @@ class UniGCRModel(nn.Module):
             past_payloads={}
         )
 
-        # u_history: 用于预测下一个 token 的 hidden states
-        # u_history[i] 用于预测位置 i+1 的 token
-        # 形状: (B, L-1, D) —— 去掉最后一个位置（因为没有对应的 target）
-        u_history = u_seq[:, :-1, :]  # (B, L-1, D)
-
         # u_last: 用于 CTR 任务或 Beam Search 初始化
         u_last = self._get_last_token(u_seq, B, lengths)  # (B, D)
 
         # Sequence-level logits 用于 GR 训练
-        logits = self.gr_head(u_history) # (B, L-1, V)
+        logits = self.gr_head(u_seq) # (B, L, V)
 
-        return u_last, u_history, logits, B
+        return u_last, u_seq, logits, B
 
     def _get_last_token(self, seq, B, lengths):
         last_token = seq[torch.arange(B, device=seq.device), lengths - 1]
@@ -410,221 +398,21 @@ class UniGCRModel(nn.Module):
         return ctr_logits, labels
 
     @torch.no_grad()
-    def generate_gr_candidates(self, batch_dict, u_last, beam_width=10, grid_mapper=None):
+    def generate_gr_candidates(self, batch_dict, u_last, beam_width=10, grid_mapper=None, lengths=None):
         """
         GR inference: generate Top-K semantic ID candidates
         return: (B, K, sem_id_layers)
         """
-        return self._beam_search_hard_negatives_v0(
+        return self._beam_search_hard_negatives_v2(
             batch_dict=batch_dict,
             u_last=u_last,
             beam_width=beam_width,
-            grid_mapper=grid_mapper
+            grid_mapper=grid_mapper,
+            lengths=lengths,
         )
 
     @torch.no_grad()
-    def _beam_search_hard_negatives_v0(self, batch_dict, u_last, beam_width, grid_mapper):
-        """
-        Beam search over semantic code layers using FIXED user state u.
-        Does NOT call HSTU in the loop.
-
-        u: (B, D)
-        return: (B, K, num_layers) semantic token ids (with offsets already in vocab)
-        """
-        B, D = u_last.shape
-        device = u_last.device
-        num_layers = self.config.sem_id_layers
-        V = self.config.sem_total_vocab
-
-        # beam scores and code sequences
-        curr_scores = torch.zeros(B, device=device)  # (B,)
-        curr_codes = None  # (B, K, t)
-
-        # helper: expand u to (B*K, D) when needed
-        def expand_u(u_base, K):
-            return u_base.unsqueeze(1).repeat(1, K, 1).view(B * K, D)
-
-        for layer_idx in range(num_layers):
-            # if we already have K beams, repeat u to match (B*K)
-            if layer_idx == 0:
-                u_in = u_last  # (B, D)
-                K_prev = 1
-            else:
-                K_prev = beam_width
-                u_in = expand_u(u_last, beam_width)  # (B*K, D)
-
-            logits = self.gr_head(u_in)  # (B or B*K, V)
-            log_probs = torch.log_softmax(logits, dim=-1)
-
-            # layer-wise masking
-            if grid_mapper is not None:
-                start, end = grid_mapper.get_layer_range(layer_idx)
-                mask = torch.full_like(logits, float("-inf"))
-                mask[:, start:end] = 0.0
-                log_probs = log_probs + mask
-
-            # expand beam
-            if layer_idx == 0:
-                # next_scores: (B, V)
-                next_scores = curr_scores.unsqueeze(1) + log_probs
-                topk_scores, topk_ids = torch.topk(next_scores, beam_width, dim=1)  # (B, K)
-                curr_scores = topk_scores.reshape(-1)  # (B*K)
-                curr_codes = topk_ids.unsqueeze(-1)  # (B, K, 1)
-            else:
-                # curr_scores is (B*K), log_probs is (B*K, V)
-                next_scores = curr_scores.unsqueeze(1) + log_probs  # (B*K, V)
-                next_scores = next_scores.view(B, beam_width, V).view(B, -1)  # (B, K*V)
-
-                best_scores, best_indices = torch.topk(next_scores, beam_width, dim=1)  # (B, K)
-
-                beam_indices = best_indices // V  # (B, K) which previous beam
-                token_indices = best_indices % V  # (B, K) new token
-
-                # gather previous codes and append
-                prev = curr_codes  # (B, K, t)
-                new_codes = []
-                for b in range(B):
-                    sel_prev = prev[b][beam_indices[b]]  # (K, t)
-                    sel_tok = token_indices[b].unsqueeze(1)  # (K, 1)
-                    new_codes.append(torch.cat([sel_prev, sel_tok], dim=1))
-                curr_codes = torch.stack(new_codes, dim=0)  # (B, K, t+1)
-                curr_scores = best_scores.reshape(-1)  # (B*K)
-
-        return curr_codes  # (B, K, num_layers)
-
-
-    @torch.no_grad()
-    def _beam_search_hard_negatives_v1(self, batch_dict, u_last, beam_width=5, grid_mapper=None):
-        """
-        在 Training 中使用 Beam Search 生成 Hard Negatives。
-        这需要多次运行 Backbone，比较耗时，但质量高。
-        """
-        B = u_last.size(0)
-        device = u_last.device
-        num_layers = self.config.sem_id_layers
-
-        # 准备 Beam Search 的初始输入
-        # 我们需要复制 batch_dict 中的所有 Tensor 到 (B*K)
-        # 但为了节省显存，我们只扩展必要的 sem_history
-
-        # 初始 Input: 原始的 sem_history
-        # (B, T)
-        curr_seqs = batch_dict['sem_history']
-
-        # 初始 Scores: (B*K)
-        # 第一步只有 1 个 Beam (原始序列)
-        curr_scores = torch.zeros(B, device=device)
-
-        # 扩展其他特征以备后续使用 (Profile, Atomic)
-        # 这里的策略是：InputLayer 处理时支持广播，或者我们将 Profile 重复 K 次
-        # 为了实现简单，我们将 batch_dict 里的 tensor 全部 repeat
-        expanded_batch = {'sem_history': curr_seqs,}
-        # for k, v in batch_dict.items():
-        #     if isinstance(v, torch.Tensor):
-        #         # 如果是 (B, ...)，重复成 (B*K, ...)
-        #         # 初始 K=1, 后续 K=beam_width
-        #         expanded_batch[k] = v  # 初始不重复
-
-        # 开始逐层生成
-        # layer_idx: 0 -> 1 -> 2
-        for layer_idx in range(num_layers):
-            # 1. 构造当前步的 Input Embedding
-            # expanded_batch['sem_history'] = curr_seqs
-            # 注意：这里的 curr_seqs 长度在不断增加
-
-            # 调用 Backbone
-            # x: (Current_Batch, Len, D)
-            x = self.input_layer(expanded_batch)
-            B_curr, L, _ = x.shape
-            lengths = (curr_seqs != 0).sum(dim=1)
-            u_seq = self.backbone(
-                past_lengths=lengths,
-                past_ids=torch.zeros((B, L), dtype=torch.long, device=x.device),
-                past_embeddings=x,
-                past_payloads={}
-            )
-            u_next = u_seq[torch.arange(B_curr), lengths - 1]
-
-            logits = self.gr_head(u_next)  # (B_curr, Vocab)
-            log_probs = torch.log_softmax(logits, dim=-1)
-
-            # Masking (只允许当前 Layer 的 ID)
-            if grid_mapper:
-                start, end = grid_mapper.get_layer_range(layer_idx)
-                mask = torch.ones_like(logits) * float('-inf')
-                mask[:, start:end] = 0
-                log_probs = log_probs + mask
-
-            # Beam Expansion
-            # curr_scores: (B_curr) -> (B_curr, 1)
-            # log_probs: (B_curr, Vocab)
-            # scores: (B_curr, Vocab)
-            next_scores = curr_scores.unsqueeze(1) + log_probs
-
-            if layer_idx == 0:
-                # 第一层：从 1 扩展到 K
-                # topk: (B, K)
-                topk_scores, topk_ids = torch.topk(next_scores, beam_width, dim=1)
-
-                # 更新状态到 B*K
-                curr_scores = topk_scores.view(-1)  # (B*K)
-
-                # 扩展 History: (B, T) -> (B, K, T) -> (B*K, T)
-                seq_exp = curr_seqs.unsqueeze(1).repeat(1, beam_width, 1).view(B * beam_width, -1)
-                new_tokens = topk_ids.view(-1, 1)
-                curr_seqs = torch.cat([seq_exp, new_tokens], dim=1)
-
-                # 扩展 Batch Dict 中的其他特征
-                for k, v in batch_dict.items():
-                    if isinstance(v, torch.Tensor):
-                        # (B, ...) -> (B, K, ...) -> (B*K, ...)
-                        shape = [B, beam_width] + list(v.shape[1:])
-                        expanded_batch[k] = v.unsqueeze(1).repeat(1, beam_width, *([1] * (v.dim() - 1))).view(-1,
-                                                                                                              *v.shape[1:])
-                # 更新 sem_history 指针
-                expanded_batch['sem_last'] = curr_seqs
-
-            else:
-                # 后续层：从 B*K 扩展到 B*K*Vocab，取 Top K
-                # next_scores: (B*K, Vocab) -> view (B, K, Vocab)
-                vocab_size = logits.size(-1)
-                next_scores = next_scores.view(B, beam_width, vocab_size).view(B, -1)
-
-                # TopK per user
-                best_scores, best_indices = torch.topk(next_scores, beam_width, dim=1)  # (B, K)
-
-                # 解码 Index
-                beam_indices = best_indices // vocab_size  # 属于哪个旧 beam
-                token_indices = best_indices % vocab_size  # 新 token 是什么
-
-                # Gather Seqs
-                # curr_seqs: (B*K, T) -> (B, K, T)
-                curr_seqs_view = curr_seqs.view(B, beam_width, -1)
-
-                new_seq_list = []
-                for b in range(B):
-                    # select beams
-                    sel_beams = curr_seqs_view[b][beam_indices[b]]  # (K, T)
-                    sel_tokens = token_indices[b].unsqueeze(1)  # (K, 1)
-                    new_seq_list.append(torch.cat([sel_beams, sel_tokens], dim=1))
-
-                curr_seqs = torch.cat(new_seq_list, dim=0)  # (B*K, T+1)
-                curr_scores = best_scores.view(-1)
-
-                # 更新 sem_history
-                expanded_batch['sem_history'] = curr_seqs
-
-        # Loop 结束
-        # curr_seqs 是 (B*K, T_orig + Layers)
-        # 我们只需要最后生成的 Layers 部分
-        generated = curr_seqs[:, -num_layers:]  # (B*K, Layers)
-        generated = generated.view(B, beam_width, num_layers)
-
-        return generated
-
-    # ... existing code ...
-    @torch.no_grad()
-    def _beam_search_hard_negatives_v2(self, batch_dict, u_last, beam_width=5, grid_mapper=None):
+    def _beam_search_hard_negatives_v2(self, batch_dict, u_last, beam_width=5, grid_mapper=None, lengths=None):
         """
         在 Training 中使用 Beam Search 生成 Hard Negatives。
         这需要多次运行 Backbone，比较耗时，但质量高。
@@ -638,16 +426,9 @@ class UniGCRModel(nn.Module):
         # 我们需要复制 batch_dict 中的所有 Tensor 到 (B*K)
         # 但为了节省显存，我们只扩展必要的 sem_history
 
-        # 初始 Input: 原始的 sem_history
-        # (B, T)
+        # 初始 Input: 原始的 sem_history，这里实际上用的是sem history eval, 即不包含target codes
         curr_seqs = batch_dict['sem_history']
-
-        # 确保初始序列长度 + 生成层数不超过 max_seq_len
-        # 如果超过，则截断历史序列（保留最近的部分）
-        init_len = curr_seqs.size(1)
-        max_init_len = max_seq_len - num_layers  # 预留生成空间
-        if init_len > max_init_len:
-            curr_seqs = curr_seqs[:, -max_init_len:]  # 截断，保留最近的 token
+        curr_lengths = lengths
 
         # 初始 Scores: (B*K)
         # 第一步只有 1 个 Beam (原始序列)
@@ -671,21 +452,17 @@ class UniGCRModel(nn.Module):
             # 注意：这里的 curr_seqs 长度在不断增加
 
             # 调用 Backbone
-            # x: (Current_Batch, Len, D)
+            # x: (B, Len, D)
             x = self.input_layer(expanded_batch)
             B_curr, L, _ = x.shape
-            lengths = (curr_seqs != 0).sum(dim=1)
-
-            # 确保 lengths 不超过 max_seq_len
-            lengths = lengths.clamp(max=max_seq_len)
 
             u_seq = self.backbone(
-                past_lengths=lengths,
+                past_lengths=curr_lengths,
                 past_ids=torch.zeros((B_curr, L), dtype=torch.long, device=x.device),  # 修复：使用 B_curr 而不是 B
                 past_embeddings=x,
                 past_payloads={}
             )
-            u_next = u_seq[torch.arange(B_curr, device=device), lengths - 1]
+            u_next = u_seq[torch.arange(B_curr, device=device), curr_lengths - 1]
 
             logits = self.gr_head(u_next)  # (B_curr, Vocab)
             log_probs = torch.log_softmax(logits, dim=-1)
@@ -698,33 +475,33 @@ class UniGCRModel(nn.Module):
                 log_probs = log_probs + mask
 
             # Beam Expansion
-            # curr_scores: (B_curr) -> (B_curr, 1)
-            # log_probs: (B_curr, Vocab)
-            # scores: (B_curr, Vocab)
             next_scores = curr_scores.unsqueeze(1) + log_probs
 
             if layer_idx == 0:
                 # 第一层：从 1 扩展到 K
                 # topk: (B, K)
                 topk_scores, topk_ids = torch.topk(next_scores, beam_width, dim=1)
-
-                # 更新状态到 B*K
                 curr_scores = topk_scores.view(-1)  # (B*K)
 
                 # 扩展 History: (B, T) -> (B, K, T) -> (B*K, T)
                 seq_exp = curr_seqs.unsqueeze(1).repeat(1, beam_width, 1).view(B * beam_width, -1)
+                lengths_exp = curr_lengths.unsqueeze(1).repeat(1, beam_width).view(-1)  # (B*K,)
+
+                # 将新 token 插入到有效位置
                 new_tokens = topk_ids.view(-1, 1)
-                curr_seqs = torch.cat([seq_exp, new_tokens], dim=1)
+                batch_indices = torch.arange(B * beam_width, device=device)
+                seq_exp[batch_indices, lengths_exp] = new_tokens.squeeze(1)
 
                 # 扩展 Batch Dict 中的其他特征
                 for k, v in batch_dict.items():
                     if isinstance(v, torch.Tensor):
                         # (B, ...) -> (B, K, ...) -> (B*K, ...)
                         shape = [B, beam_width] + list(v.shape[1:])
-                        expanded_batch[k] = v.unsqueeze(1).repeat(1, beam_width, *([1] * (v.dim() - 1))).view(-1,
-                                                                                                              *v.shape[
-                                                                                                                  1:])
-                # 更新 sem_history 指针
+                        expanded_batch[k] = v.unsqueeze(1).repeat(1, beam_width, *([1] * (v.dim() - 1))).view(-1, *v.shape[1:])
+
+                # 更新 sem_history, lengths
+                curr_lengths = lengths_exp + 1
+                curr_seqs = seq_exp
                 expanded_batch['sem_history'] = curr_seqs
 
             else:
@@ -743,25 +520,42 @@ class UniGCRModel(nn.Module):
                 # Gather Seqs
                 # curr_seqs: (B*K, T) -> (B, K, T)
                 curr_seqs_view = curr_seqs.view(B, beam_width, -1)
+                curr_lengths_view = curr_lengths.view(B, beam_width)
 
                 new_seq_list = []
+                new_lengths_list = []
                 for b in range(B):
                     # select beams
-                    sel_beams = curr_seqs_view[b][beam_indices[b]]  # (K, T)
-                    sel_tokens = token_indices[b].unsqueeze(1)  # (K, 1)
-                    new_seq_list.append(torch.cat([sel_beams, sel_tokens], dim=1))
+                    sel_seqs = curr_seqs_view[b][beam_indices[b]].clone()  # (K, L)
+                    sel_lengths = curr_lengths_view[b][beam_indices[b]]  # (K,)
+                    sel_tokens = token_indices[b]  # (K,)
+
+                    # 将新 token 插入到每个 beam 的有效位置
+                    for k in range(beam_width):
+                        sel_seqs[k, sel_lengths[k]] = sel_tokens[k]
+
+                    new_seq_list.append(sel_seqs)
+                    new_lengths_list.append(sel_lengths + 1)
 
                 curr_seqs = torch.cat(new_seq_list, dim=0)  # (B*K, T+1)
+                curr_lengths = torch.cat(new_lengths_list, dim=0)
                 curr_scores = best_scores.view(-1)
-
-                # 更新 sem_history
                 expanded_batch['sem_history'] = curr_seqs
 
-        # Loop 结束
-        # curr_seqs 是 (B*K, T_orig + Layers)
-        # 我们只需要最后生成的 Layers 部分
-        generated = curr_seqs[:, -num_layers:]  # (B*K, Layers)
-        generated = generated.view(B, beam_width, num_layers)
+        # 提取生成的 tokens（从每个序列的末尾 num_layers 个有效位置）
+        generated = []
+        curr_seqs_view = curr_seqs.view(B, beam_width, -1)
+        curr_lengths_view = curr_lengths.view(B, beam_width)
+
+        for b in range(B):
+            beam_codes = []
+            for k in range(beam_width):
+                end_pos = curr_lengths_view[b, k].item()
+                start_pos = end_pos - num_layers
+                codes = curr_seqs_view[b, k, start_pos:end_pos]
+                beam_codes.append(codes)
+            generated.append(torch.stack(beam_codes, dim=0))
+
+        generated = torch.stack(generated, dim=0)  # (B, K, num_layers)
 
         return generated
-# ... existing code ...

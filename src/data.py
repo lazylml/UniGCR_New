@@ -100,6 +100,14 @@ class UniversalDataset(Dataset):
 
             self.data.append(sample)
 
+    def _truncate_and_pad(self, seq):
+        max_len = self.config.max_seq_len
+        if len(seq) > max_len:
+            processed_seq = seq[-max_len:]
+        else:
+            processed_seq = seq + [0] * (max_len - len(seq))
+        return processed_seq
+
     def __getitem__(self, idx):
         raw_item = self.data[idx]
         output = {}
@@ -112,27 +120,17 @@ class UniversalDataset(Dataset):
         # ===========================
         if self.config.use_semantic_seq:
             seq_codes = self.grid_mapper.flatten_sequence(raw_item['sem_seq'])
-            full_seq = seq_codes + tgt_codes
+            full_codes = seq_codes + tgt_codes
 
-            max_len = self.config.max_seq_len
-            if len(full_seq) > max_len:
-                full_seq = full_seq[-max_len:]
-            else:
-                full_seq = full_seq + [0] * (max_len - len(full_seq))
-
-            # 模型输入: tokens [0, L-1]
-            output['sem_history'] = torch.tensor(full_seq[:-1], dtype=torch.long)
-            # 训练标签 (预测下一个 token): tokens [1, L]
-            output['sem_target'] = torch.tensor(full_seq[1:], dtype=torch.long)
+            sem_history = full_codes[:-1]
+            output['sem_history'] = torch.tensor(self._truncate_and_pad(sem_history), dtype=torch.long)
+            sem_target = full_codes[1:]
+            output['sem_target'] = torch.tensor(self._truncate_and_pad(sem_target), dtype=torch.long)
 
             # === 新增：用于 Eval 的纯净 history（不包含 target codes） ===
             # 只包含历史 item 的 codes，用于 beam search 生成
-            pure_history = seq_codes  # 不含 target
-            if len(pure_history) > max_len - self.config.sem_id_layers:
-                pure_history = pure_history[-(max_len - self.config.sem_id_layers):]
-            else:
-                pure_history = pure_history + [0] * (max_len - self.config.sem_id_layers - len(pure_history))
-            output['sem_history_eval'] = torch.tensor(pure_history, dtype=torch.long)
+            # todo check 是否有必要和sem history区分
+            output['sem_history_eval'] = torch.tensor(self._truncate_and_pad(seq_codes), dtype=torch.long)
 
             # 用于 CTR 任务的正样本表示
             output['ctr_pos_codes'] = torch.tensor(tgt_codes, dtype=torch.long)

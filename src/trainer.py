@@ -118,7 +118,7 @@ class UniGCRTrainer:
                 for k, v in batch.items()
                 if isinstance(v, torch.Tensor)
             }
-            
+
             self.model_engine.zero_grad()
 
             # 2. Forward Pass (Shared Backbone & GR Head)
@@ -133,11 +133,11 @@ class UniGCRTrainer:
             if self.config.use_semantic_seq:
                 # Target: Flattened Semantic Sequence (shifted by 1)
                 # sem_target shape: (B, L-1) —— 对齐 gr_logits
-                sem_target = batch['sem_target'] # (B, L-1)
+                sem_target = batch['sem_target'] # (B, L)
 
                 # Flatten for CrossEntropy
-                # logits: (B, L-1, V) -> (B*(L-1), V)
-                # target: (B, L-1) -> (B*(L-1),)
+                # logits: (B, L, V) -> (B*L, V)
+                # target: (B, L) -> (B*L,)
                 logits_flat = gr_logits.view(-1, gr_logits.size(-1))
                 target_flat = sem_target.view(-1)
 
@@ -237,14 +237,14 @@ class UniGCRTrainer:
 
         for batch in iterator:
             batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-            
+
             # --- A. 计算 Validation Loss ---
             # 1. Forward
             u_last, u_history, gr_logits, B = self.model_engine(batch)
 
             # 2. GR Val Loss (Sequence-level)
             if self.config.use_semantic_seq:
-                sem_target = batch['sem_target']  # (B, L-1)
+                sem_target = batch['sem_target']  # (B, L)
 
                 logits_flat = gr_logits.view(-1, gr_logits.size(-1))
                 target_flat = sem_target.view(-1)
@@ -280,7 +280,6 @@ class UniGCRTrainer:
             # 使用纯净的 history 进行 beam search
             # 构造一个干净的 batch_dict 用于生成
             eval_batch = {'sem_history': batch['sem_history_eval']}
-
             # 需要重新计算 u_last（基于纯净 history）
             with torch.no_grad():
                 # 临时 forward 只为获取 u_last
@@ -299,7 +298,8 @@ class UniGCRTrainer:
                 batch_dict=eval_batch,
                 u_last=u_last_eval,
                 beam_width=topk,
-                grid_mapper=grid_mapper
+                grid_mapper=grid_mapper,
+                lengths=lengths_eval,
             )
 
             batch_hit, batch_ndcg = compute_gr_metrics(candidates, batch['target_item'], grid_mapper, topk)
