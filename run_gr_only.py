@@ -8,7 +8,8 @@ from src.data import get_dataloaders
 from src.model import UniGCRModel
 from src.trainer import UniGCRTrainer
 from src.utils import set_seed, setup_distributed, is_main_process
-import deepspeed
+# import deepspeed
+import wandb
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Uni-GCR GR-Only Training")
@@ -16,10 +17,17 @@ def parse_args():
     # parser.add_argument('--deepspeed_config', type=str, default='ds_config.json')
     parser.add_argument('--data_path', type=str, default='data/GRID/outputs/beauty_user_item_sequences')
     parser.add_argument('--grid_mapping', type=str, default='data/GRID/semantic_ids/beauty/part-00000.pkl')
-    parser = deepspeed.add_config_arguments(parser)
+    # parser = deepspeed.add_config_arguments(parser)
     return parser.parse_args()
 
 def main():
+    # ===== TF32 加速（A6000 强烈推荐）=====
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # 可选：benchmark（对固定 shape 有帮助）
+    torch.backends.cudnn.benchmark = True
+
     args = parse_args()
 
     # 1. 初始化分布式环境
@@ -51,8 +59,18 @@ def main():
     if is_main_process():
         print(f"GRID Vocabulary Size: {conf.sem_total_vocab}")
 
+
     # 5. 初始化模型 (UniGCRModel 内部会自动加载补丁后的 HSTU)
     model = UniGCRModel(conf)
+
+    if is_main_process():
+        wandb.init(
+            entity="unigcr",
+            project="unigcr",
+            name="gr",
+            config=vars(conf),
+        )
+        wandb.watch(model, log="gradients", log_freq=100)
 
     # 6. 使用 Trainer 运行
     # 由于 conf.enable_ctr = False，Trainer 内部的 loss 计算会自动跳过 CTR 部分
@@ -69,6 +87,9 @@ def main():
 
     # 7. 开始训练
     trainer.train()
+
+    if is_main_process():
+        wandb.finish()
 
 
 if __name__ == "__main__":

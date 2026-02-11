@@ -35,23 +35,31 @@ class UniGCRConfig:
     # --- [User Profile] ---
     cat_feature_vocab_sizes: List[int] = field(default_factory=lambda: [1000, 20]) 
     num_feature_size: int = 5
-    
+
+    # --- [数据参数] ---
+    num_workers: int = 8
+
     # --- [模型参数] ---
     embed_dim: int = 64
     max_seq_len: int = 150  # 需足够容纳 (Sem_Len + Atom_Len + Profile_Len)
-    hstu_layers: int = 2
-    hstu_heads: int = 2
-    dropout: float = 0.1
+    hstu_layers: int = 4 # default 2
+    hstu_heads: int = 4 # default 2
+    dropout: float = 0.5
     attn_alpha: float = 1.0
     
     # --- [训练参数] ---
     patience: int = 3
-    batch_size: int = 64
+    train_batch_size: int = 128 #default 64
     lr: float = 1e-3
-    epochs: int = 50 #50
+    epochs: int = 200 #50
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 42
-    
+
+    # ===== Eval strategy =====
+    eval_batch_size: int = 128 #default 64
+    eval_interval: int = 50        # 每 N 个 epoch 才做 ranking eval
+    eval_with_ranking: bool = True
+
     # --- [Uni-GCR Loss] ---
     memory_bank_size: int = 20
     num_hard_negatives: int = 5

@@ -180,7 +180,7 @@ def get_dataloaders(config):
         train_sampler = None
         val_sampler = None
 
-    train_dl = DataLoader(train_ds, batch_size=config.batch_size, sampler=train_sampler, num_workers=2)
-    val_dl = DataLoader(val_ds, batch_size=config.batch_size, sampler=val_sampler, num_workers=2)
+    train_dl = DataLoader(train_ds, batch_size=config.train_batch_size, sampler=train_sampler, num_workers=config.num_workers)
+    val_dl = DataLoader(val_ds, batch_size=config.eval_batch_size, sampler=val_sampler, num_workers=config.num_workers)
 
     return train_dl, val_dl

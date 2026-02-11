@@ -194,6 +194,21 @@ class UniGCRTrainer:
             
         # 计算平均 Loss
         num_batches = len(self.train_loader)
+
+        metrics = {
+            'train/loss': total_loss / num_batches,
+            'train/gr_loss': gr_loss_sum / num_batches,
+        }
+
+        if self.config.enable_ctr:
+            metrics['train/ctr_loss'] = ctr_loss_sum / num_batches
+
+        if is_main_process():
+            import wandb
+            wandb.log(metrics, step=epoch_idx)
+
+        # return metrics
+
         return {
             'loss': total_loss / num_batches,
             'gr_loss': gr_loss_sum / num_batches,
@@ -201,7 +216,7 @@ class UniGCRTrainer:
         }
 
     @torch.no_grad()
-    def evaluate(self, topk=10):
+    def evaluate(self, topk=10, with_ranking=True):
         """
         完整的评估逻辑：Beam Search 生成 -> Item 还原 -> 指标计算
         """
@@ -267,45 +282,26 @@ class UniGCRTrainer:
                 all_ctr_labels.append(ctr_labels.view(-1))
 
             # --- B. 计算 GR Ranking Metrics (Hit/NDCG) ---
-            # 这部分需要 Beam Search 生成，比较耗时
-            # 如果只为了 Early Stop (Loss based)，可以跳过这步，但为了监控指标还是加上
-            # Beam Search 依然使用 u_last 作为起点
-            # candidates = real_model.generate_gr_candidates(
-            #     batch_dict=batch,
-            #     u_last=u_last,
-            #     beam_width=topk,
-            #     grid_mapper=grid_mapper
-            # )
+            if with_ranking:
+                # 这部分需要 Beam Search 生成，比较耗时
+                # 如果只为了 Early Stop (Loss based)，可以跳过这步，但为了监控指标还是加上
 
-            # 使用纯净的 history 进行 beam search
-            # 构造一个干净的 batch_dict 用于生成
-            eval_batch = {'sem_history': batch['sem_history_eval']}
-            # 需要重新计算 u_last（基于纯净 history）
-            with torch.no_grad():
-                # 临时 forward 只为获取 u_last
-                x = real_model.input_layer(eval_batch)
-                B_eval, L_eval, _ = x.shape
+                # 使用纯净的 history 进行 beam search
+                # 构造一个干净的 batch_dict 用于生成
+                eval_batch = {'sem_history': batch['sem_history_eval']}
                 lengths_eval = (eval_batch['sem_history'] != 0).sum(dim=1)
-                u_seq_eval = real_model.backbone(
-                    past_lengths=lengths_eval,
-                    past_ids=torch.zeros((B_eval, L_eval), dtype=torch.long, device=device),
-                    past_embeddings=x,
-                    past_payloads={}
+
+                candidates = real_model.generate_gr_candidates(
+                    batch_dict=eval_batch,
+                    beam_width=topk,
+                    grid_mapper=grid_mapper,
+                    lengths=lengths_eval,
                 )
-                u_last_eval = u_seq_eval[torch.arange(B_eval, device=device), lengths_eval - 1]
 
-            candidates = real_model.generate_gr_candidates(
-                batch_dict=eval_batch,
-                u_last=u_last_eval,
-                beam_width=topk,
-                grid_mapper=grid_mapper,
-                lengths=lengths_eval,
-            )
-
-            batch_hit, batch_ndcg = compute_gr_metrics(candidates, batch['target_item'], grid_mapper, topk)
-            all_hit_sums += batch_hit * batch['sem_target_eval'].size(0)
-            all_ndcg_sums += batch_ndcg * batch['sem_target_eval'].size(0)
-            all_gr_count += batch['sem_target_eval'].size(0)
+                batch_hit, batch_ndcg = compute_gr_metrics(candidates, batch['target_item'], grid_mapper, topk)
+                all_hit_sums += batch_hit * batch['sem_target_eval'].size(0)
+                all_ndcg_sums += batch_ndcg * batch['sem_target_eval'].size(0)
+                all_gr_count += batch['sem_target_eval'].size(0)
 
         # # --- 汇总结果 ---
         num_batches = len(self.val_loader)
@@ -346,6 +342,15 @@ class UniGCRTrainer:
             'Hit@10': final_hit,
             'NDCG@10': final_ndcg
         }
+
+        if is_main_process():
+            import wandb
+            wandb.log({
+                'val/gr_loss': avg_gr_loss,
+                'val/Hit@10': final_hit,
+                'val/NDCG@10': final_ndcg,
+            }, step=self.current_epoch)
+
         # 3. CTR Metrics 汇总 (Gather & Sklearn)
         if self.config.enable_ctr and len(all_ctr_logits) > 0:
             local_logits = torch.cat(all_ctr_logits)
@@ -361,6 +366,11 @@ class UniGCRTrainer:
                 auc, logloss = compute_ctr_metrics(global_logits, global_labels)
                 results['AUC'] = auc
                 results['LogLoss'] = logloss
+                wandb.log({
+                    'val/ctr_loss': avg_ctr_loss,
+                    'val/AUC': auc,
+                    'val/LogLoss': logloss,
+                })
         
         return results
 
@@ -398,6 +408,7 @@ class UniGCRTrainer:
             print(f"Start Training. Monitor: {monitor_metric} (Best: {mode})")
 
         for epoch in range(1, self.config.epochs + 1):
+            self.current_epoch = epoch
             if hasattr(self.train_loader.sampler, 'set_epoch'):
                 self.train_loader.sampler.set_epoch(epoch)
             
@@ -405,10 +416,16 @@ class UniGCRTrainer:
             train_metrics = self.train_epoch(epoch)
             
             # 2. Eval
-            eval_metrics = self.evaluate(topk=10)
+            if epoch % self.config.eval_interval == 0:
+                eval_metrics = self.evaluate(topk=10, with_ranking=True)
+            else:
+                eval_metrics = self.evaluate(topk=10, with_ranking=False)
+
+            # eval_metrics = self.evaluate(topk=10)
             
             # 3. Logging & Early Stop Logic
             if is_main_process():
+
                 # 打印日志
                 log_str = f"Ep {epoch} | "
                 log_str += f"Tr_Loss: GR={train_metrics['gr_loss']:.4f} "

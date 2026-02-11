@@ -398,37 +398,32 @@ class UniGCRModel(nn.Module):
         return ctr_logits, labels
 
     @torch.no_grad()
-    def generate_gr_candidates(self, batch_dict, u_last, beam_width=10, grid_mapper=None, lengths=None):
+    def generate_gr_candidates(self, batch_dict, beam_width=10, grid_mapper=None, lengths=None):
         """
         GR inference: generate Top-K semantic ID candidates
         return: (B, K, sem_id_layers)
         """
         return self._beam_search_hard_negatives_v2(
             batch_dict=batch_dict,
-            u_last=u_last,
             beam_width=beam_width,
             grid_mapper=grid_mapper,
             lengths=lengths,
         )
 
     @torch.no_grad()
-    def _beam_search_hard_negatives_v2(self, batch_dict, u_last, beam_width=5, grid_mapper=None, lengths=None):
+    def _beam_search_hard_negatives_v2(self, batch_dict, beam_width=5, grid_mapper=None, lengths=None):
         """
         在 Training 中使用 Beam Search 生成 Hard Negatives。
         这需要多次运行 Backbone，比较耗时，但质量高。
         """
-        B = u_last.size(0)
-        device = u_last.device
-        num_layers = self.config.sem_id_layers
-        max_seq_len = self.config.max_seq_len  # 获取最大序列长度
-
-        # 准备 Beam Search 的初始输入
-        # 我们需要复制 batch_dict 中的所有 Tensor 到 (B*K)
-        # 但为了节省显存，我们只扩展必要的 sem_history
 
         # 初始 Input: 原始的 sem_history，这里实际上用的是sem history eval, 即不包含target codes
         curr_seqs = batch_dict['sem_history']
         curr_lengths = lengths
+
+        B = curr_seqs.size(0)
+        device = curr_seqs.device
+        num_layers = self.config.sem_id_layers
 
         # 初始 Scores: (B*K)
         # 第一步只有 1 个 Beam (原始序列)
