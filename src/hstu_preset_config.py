@@ -41,6 +41,21 @@ HSTU_BOOKS_N512_LARGE = HSTUPreset(
     eval_batch_size=128,
     lr=1e-3,
     epochs=200,
-    head_dim = 8,  # 对应 dv
-    qk_dim = 8,  # 对应 dqk
+    head_dim = 8*4,  # 对应 dv
+    qk_dim = 8*4,  # 对应 dqk
+)
+
+# follow research_hstu/configs/hstu-sampled-softmax-n512-large-final.gin
+UniGCR = HSTUPreset(
+    embed_dim=128,
+    hstu_layers=6,
+    hstu_heads=8,
+    dropout=0.3,
+    max_seq_len=50*3, #考虑到我们使用3层SID
+    train_batch_size=128,
+    eval_batch_size=128,
+    lr=5e-4,
+    epochs=200,
+    head_dim = 32,  # 对应 dv
+    qk_dim = 32,  # 对应 dqk
 )

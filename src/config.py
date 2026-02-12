@@ -19,7 +19,6 @@ class UniGCRConfig:
     # --- [Semantic ID / GRID] ---
     sem_id_layers: int = 3
     sem_id_codebook_size: int = 256
-    grid_mapping_path: str = "data/beauty/semantic_ids.json"
 
     # --- [Atomic ID] ---
     num_atomic_items: int = 0
@@ -31,6 +30,8 @@ class UniGCRConfig:
 
     # --- [数据参数] ---
     num_workers: int = 8
+    grid_mapping_path: str = "data/GRID/semantic_ids/beauty/part-00000.pkl"
+    data_path: str = "data/GRID/outputs/beauty_user_item_sequences"
 
     # --- [模型参数] ---
     embed_dim: int = 64

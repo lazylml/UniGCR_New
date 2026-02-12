@@ -4,7 +4,7 @@ import argparse
 import torch
 import torch.nn as nn
 from src.config import UniGCRConfig, apply_hstu_preset
-from src.hstu_preset_config import HSTU_BOOKS_N512
+from src.hstu_preset_config import HSTU_BOOKS_N512, HSTU_BOOKS_N512_LARGE
 from src.data import get_dataloaders
 from src.model import UniGCRModel
 from src.trainer import UniGCRTrainer
@@ -15,10 +15,6 @@ import wandb
 def parse_args():
     parser = argparse.ArgumentParser(description="Uni-GCR GR-Only Training")
     parser.add_argument('--local_rank', type=int, default=-1)
-    # parser.add_argument('--deepspeed_config', type=str, default='ds_config.json')
-    parser.add_argument('--data_path', type=str, default='data/GRID/outputs/beauty_user_item_sequences')
-    parser.add_argument('--grid_mapping', type=str, default='data/GRID/semantic_ids/beauty/part-00000.pkl')
-    # parser = deepspeed.add_config_arguments(parser)
     return parser.parse_args()
 
 def main():
@@ -36,7 +32,8 @@ def main():
 
     # 2. 初始化配置
     conf = UniGCRConfig()
-    apply_hstu_preset(conf, HSTU_BOOKS_N512)
+    # apply_hstu_preset(conf, HSTU_BOOKS_N512)
+    apply_hstu_preset(conf, HSTU_BOOKS_N512_LARGE)
 
     # --- [GR-ONLY 核心配置] ---
     conf.enable_ctr = False  # 强制关闭 CTR 任务
@@ -46,8 +43,8 @@ def main():
     conf.use_num_profile = False
 
     # 动态参数同步
-    conf.grid_mapping_path = args.grid_mapping
-    conf.data_path = args.data_path
+    # conf.grid_mapping_path = args.grid_mapping
+    # conf.data_path = args.data_path
 
     set_seed(conf.seed)
 

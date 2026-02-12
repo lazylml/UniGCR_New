@@ -18,6 +18,7 @@ __pycache__/
 checkpoints/
 logs/
 runs/
+wandb/
 
 ############################
 # Large / raw data (DO NOT COMMIT)
