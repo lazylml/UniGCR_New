@@ -42,10 +42,9 @@ def main():
     conf.use_cat_profile = False  # 暂时不使用画像简化任务
     conf.use_num_profile = False
 
-    # 动态参数同步
-    # conf.grid_mapping_path = args.grid_mapping
-    # conf.data_path = args.data_path
-
+    timestamp = datetime.now().strftime("%m%d-%H%M")
+    conf.ckpt_name = (f"GR_L{conf.hstu_layers}H{conf.hstu_heads}D{conf.embed_dim}"
+                      f"Dh{conf.head_dim}DP{str(conf.dropout).replace('.', '')}_{timestamp}")
     set_seed(conf.seed)
 
     # 3. 准备数据 (这里会触发 GridMapper 加载)
@@ -63,20 +62,10 @@ def main():
     model = UniGCRModel(conf)
 
     if is_main_process():
-        timestamp = datetime.now().strftime("%m%d-%H%M")
-        run_name = (
-            f"GR_"
-            f"L{conf.hstu_layers}"
-            f"H{conf.hstu_heads}"
-            f"D{conf.embed_dim}"
-            f"HD{conf.head_dim}"
-            f"DP{str(conf.dropout).replace('.', '')}"
-            f"_{timestamp}"
-        )
         wandb.init(
             entity="unigcr",
             project="unigcr",
-            name=run_name,
+            name=conf.ckpt_name,
             config=vars(conf),
         )
         wandb.watch(model, log="gradients", log_freq=100)

@@ -76,10 +76,10 @@ class UniGCRTrainer:
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.lr)
         self.model_engine = self.model
 
-        os.makedirs("checkpoints", exist_ok=True)
+        os.makedirs(config.ckpt_path, exist_ok=True)
 
         filename = f"ckpt_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.pt"
-        path = os.path.join("checkpoints", filename)
+        path = os.path.join(config.ckpt_path, config.ckpt_name)
         self.best_ckpt_path = path
 
     def calculate_ctr_loss(self, ctr_logits, ctr_labels):

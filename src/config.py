@@ -34,6 +34,7 @@ class UniGCRConfig:
     num_workers: int = 8
     grid_mapping_path: str = "data/GRID/semantic_ids/beauty/part-00000.pkl"
     data_path: str = "data/GRID/outputs/beauty_user_item_sequences"
+    ckpt_path: str = "checkpoints/beauty"
 
     # --- [模型参数] ---
     embed_dim: int = 64
