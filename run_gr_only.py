@@ -69,7 +69,7 @@ def main():
             f"L{conf.hstu_layers}"
             f"H{conf.hstu_heads}"
             f"D{conf.embed_dim}"
-            f"Dh{conf.embed_dim // conf.hstu_heads}"
+            f"HD{conf.head_dim}"
             f"DP{str(conf.dropout).replace('.', '')}"
             f"_{timestamp}"
         )

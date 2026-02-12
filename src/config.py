@@ -12,7 +12,7 @@ class UniGCRConfig:
     use_cat_profile: bool = True      # 是否使用类别用户画像
     use_num_profile: bool = True      # 是否使用数值用户画像
     use_hstu_config: bool = True
-    hstu_preset_name: str = "HSTU_BOOKS_N512_Mini"  # 选项见 hstu_preset_config.py
+    hstu_preset_name: str = "HSTU_BOOKS_N512"  # 选项见 hstu_preset_config.py
 
     # --- [CTR 模块微调] ---
     ctr_use_self_attn: bool = True    # Candidate-Aware Self-Attention
@@ -41,7 +41,8 @@ class UniGCRConfig:
     hstu_layers: int = 4 # default 2
     hstu_heads: int = 4 # default 2
     dropout: float = 0.5
-    attn_alpha: float = 1.7
+    attn_alpha: float = 1.0
+    #todo 1.7, test later
     head_dim: int = 16  # 对应 dv
     qk_dim: int = 16  # 对应 dqk
 
@@ -55,7 +56,7 @@ class UniGCRConfig:
 
     # ===== Eval strategy =====
     eval_batch_size: int = 128 #default 64
-    eval_interval: int = 2        # 每 N 个 epoch 才做 ranking eval
+    eval_interval: int = 10        # 每 N 个 epoch 才做 ranking eval
     eval_with_ranking: bool = True
 
     # --- [Uni-GCR Loss] ---
