@@ -7,7 +7,8 @@ import numpy as np
 from .utils import is_main_process
 import math
 import wandb
-
+from datetime import datetime
+import os
 
 def compute_gr_metrics(candidates, target_items, grid_mapper, topk):
     """
@@ -53,12 +54,13 @@ def compute_item_level_metrics(pred_items, target_items, k):
     return sum(hits) / len(hits), sum(ndcgs) / len(ndcgs)
 
 class UniGCRTrainer:
-    def __init__(self, config, args, model, train_loader, val_loader=None):
+    def __init__(self, config, args, model, train_loader, val_loader=None, test_loader=None):
         self.config = config
         self.args = args
         self.train_loader = train_loader
         self.val_loader = val_loader
-        
+        self.test_loader = test_loader
+
         # --- Loss Definitions ---
         # GR 任务: 预测下一个 Semantic Code (Cross Entropy)
         # ignore_index=0 会自动忽略 target 中值为 0 的位置
@@ -74,6 +76,11 @@ class UniGCRTrainer:
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.lr)
         self.model_engine = self.model
 
+        os.makedirs("checkpoints", exist_ok=True)
+
+        filename = f"ckpt_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.pt"
+        path = os.path.join("checkpoints", filename)
+        self.best_ckpt_path = path
 
     def calculate_ctr_loss(self, ctr_logits, ctr_labels):
         """
@@ -218,17 +225,22 @@ class UniGCRTrainer:
         }
 
     @torch.no_grad()
-    def evaluate(self, topk=[5, 10], with_ranking=True):
+    def evaluate(self, topk=[5, 10], with_ranking=True, mode='val'):
         """
         评估逻辑：
         1. 计算 Validation Loss (GR & CTR) -> 用于 Early Stop
         2. 计算 Metrics (Hit/NDCG/AUC/LogLoss) -> 用于展示效果
         """
-        if not self.val_loader: return {}
-        
+        if mode=='val':
+            eval_data = self.val_loader
+        elif mode=='test':
+            eval_data = self.test_loader
+        else:
+            raise {}
+
         self.model_engine.eval()
         device = self.device
-        grid_mapper = self.val_loader.dataset.grid_mapper
+        grid_mapper = eval_data.dataset.grid_mapper
 
         gr_metrics = {
             k: {'hit': 0.0, 'ndcg': 0.0}
@@ -249,7 +261,10 @@ class UniGCRTrainer:
         all_ctr_logits = []
         all_ctr_labels = []
 
-        iterator = tqdm(self.val_loader, desc="Eval") if is_main_process() else self.val_loader
+        if mode=='val':
+            iterator = tqdm(eval_data, desc="Eval") if is_main_process() else eval_data
+        else:
+            iterator = tqdm(eval_data, desc="Final Eval (on test)") if is_main_process() else eval_data
         real_model = self.model
 
         for batch in iterator:
@@ -307,12 +322,15 @@ class UniGCRTrainer:
 
 
         # # --- 汇总结果 ---
-        num_batches = len(self.val_loader)
+        num_batches = len(eval_data)
 
         avg_gr_loss = val_gr_loss_sum / num_batches
         avg_ctr_loss = val_ctr_loss_sum / num_batches
 
-        results = {'val_gr_loss': avg_gr_loss}
+        if mode=='val':
+            results = {'val_gr_loss': avg_gr_loss}
+        else:
+            results = {'test_gr_loss': avg_gr_loss}
 
         if all_gr_count > 0:
             if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -336,10 +354,16 @@ class UniGCRTrainer:
                     results[f'NDCG@{k}'] = gr_metrics[k]['ndcg'] / all_gr_count
 
         if is_main_process():
-            log_dict = {'val/gr_loss': avg_gr_loss}
-            for k in topk:
-                log_dict[f'val/Hit@{k}'] = results.get(f'Hit@{k}', 0.0)
-                log_dict[f'val/NDCG@{k}'] = results.get(f'NDCG@{k}', 0.0)
+            if mode=='val':
+                log_dict = {'val/gr_loss': avg_gr_loss}
+                for k in topk:
+                    log_dict[f'val/Hit@{k}'] = results.get(f'Hit@{k}', 0.0)
+                    log_dict[f'val/NDCG@{k}'] = results.get(f'NDCG@{k}', 0.0)
+            else:
+                log_dict = {'test/gr_loss': avg_gr_loss}
+                for k in topk:
+                    log_dict[f'test/Hit@{k}'] = results.get(f'Hit@{k}', 0.0)
+                    log_dict[f'test/NDCG@{k}'] = results.get(f'NDCG@{k}', 0.0)
 
             wandb.log(log_dict, step=self.current_epoch)
 
@@ -351,6 +375,7 @@ class UniGCRTrainer:
 
             global_logits = gather_tensors(local_logits)
             global_labels = gather_tensors(local_labels)
+
 
             results['val_ctr_loss'] = avg_ctr_loss
 
@@ -368,21 +393,6 @@ class UniGCRTrainer:
 
         return results
 
-    def save(self, tag):
-        """保存 Checkpoint"""
-        # self.model_engine.save_checkpoint(save_dir="checkpoints", tag=tag)
-        # self.model.save_checkpoint(save_dir="checkpoints", tag=tag)
-        import os
-        os.makedirs("checkpoints", exist_ok=True)
-        path = os.path.join("checkpoints", f"{tag}.pt")
-        torch.save({
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "config": vars(self.config) if hasattr(self.config, "__dict__") else self.config,
-        }, path)
-        if is_main_process():
-            print(f"[Save] checkpoint saved to {path}")
-
     def train(self):
         # Early Stopping 策略设置
         # 如果开启 CTR: 监控 CTR LogLoss (min)
@@ -392,9 +402,9 @@ class UniGCRTrainer:
             mode = 'min'
             best_val = float('inf')
         else:
-            monitor_metric = 'val_gr_loss'
-            mode = 'min'
-            best_val = float('inf')
+            monitor_metric = 'NDCG@10'
+            mode = 'max'
+            best_val = -float('inf')
             
         patience_counter = 0
         
@@ -431,8 +441,12 @@ class UniGCRTrainer:
                 log_str += "Eval: "
                 log_str += f"GR_Loss={eval_metrics.get('val_gr_loss', 0):.4f} "
 
+                if 'Hit@5' in eval_metrics:
+                    log_str += f"Hit@5={eval_metrics['Hit@5']:.4f} "
                 if 'Hit@10' in eval_metrics:
                     log_str += f"Hit@10={eval_metrics['Hit@10']:.4f} "
+                if 'NDCG@5' in eval_metrics:
+                    log_str += f"NDCG@5={eval_metrics['NDCG@5']:.4f} "
                 if 'NDCG@10' in eval_metrics:
                     log_str += f"NDCG@10={eval_metrics['NDCG@10']:.4f} "
 
@@ -440,28 +454,49 @@ class UniGCRTrainer:
                     log_str += f"AUC={eval_metrics.get('AUC',0):.4f} LogLoss={eval_metrics.get('LogLoss',0):.4f}"
                 
                 print(log_str)
-                
-                # 获取当前监控指标
-                current_val = eval_metrics.get(monitor_metric, float('inf'))
-                
-                # 判断更优
-                improved = False
-                if mode == 'min':
-                    if current_val < best_val: improved = True
-                else:
-                    if current_val > best_val: improved = True
-                
-                if improved:
-                    best_val = current_val
-                    patience_counter = 0
-                    print(f" >> New Best {monitor_metric}! Saving...")
-                    self.save("best_model")
-                else:
-                    patience_counter += 1
-                    print(f" >> No improve. Patience {patience_counter}/{self.config.patience}")
-                
-            # 同步 Early Stop 状态 (可选，这里依赖主进程 break 也可以，或者广播)
-            # 简单起见，如果达到耐心值，主进程抛出异常或结束，这里我们不做多进程同步退出
-            if patience_counter >= self.config.patience:
-                if is_main_process(): print("Early Stopping.")
-                break
+
+                if epoch % self.config.eval_interval == 0:
+                    # 获取当前监控指标
+                    current_val = eval_metrics.get(monitor_metric, float('inf'))
+
+                    # 判断更优
+                    improved = False
+                    if mode == 'min':
+                        if current_val < best_val: improved = True
+                    else:
+                        if current_val > best_val: improved = True
+
+                    if improved:
+                        best_val = current_val
+                        patience_counter = 0
+                        print(f" >> New Best {monitor_metric}! Saving...")
+                        self.save()
+                    else:
+                        patience_counter += 1
+                        print(f" >> No improve. Patience {patience_counter}/{self.config.patience}")
+
+                # 同步 Early Stop 状态 (可选，这里依赖主进程 break 也可以，或者广播)
+                # 简单起见，如果达到耐心值，主进程抛出异常或结束，这里我们不做多进程同步退出
+                if patience_counter >= self.config.patience:
+                    if is_main_process(): print("Early Stopping.")
+                    break
+    def load_best(self):
+        ckpt = torch.load(self.best_ckpt_path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model"])
+
+        if is_main_process():
+            print(f"[Load] checkpoint loaded from {self.best_ckpt_path}")
+
+    def save(self):
+        """保存 Checkpoint"""
+        # self.model_engine.save_checkpoint(save_dir="checkpoints", tag=tag)
+        # self.model.save_checkpoint(save_dir="checkpoints", tag=tag)
+
+        torch.save({
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "config": vars(self.config) if hasattr(self.config, "__dict__") else self.config,
+        }, self.best_ckpt_path)
+
+        if is_main_process():
+            print(f"[Save] checkpoint saved to {self.best_ckpt_path}")

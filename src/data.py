@@ -166,21 +166,26 @@ class UniversalDataset(Dataset):
 def get_dataloaders(config):
     train_ds = UniversalDataset(config, mode='train')
     val_ds = UniversalDataset(config, mode='eva')
+    test_ds = UniversalDataset(config, mode='test')
 
     # 同步动态生成的词表大小
     if config.use_semantic_seq:
         val_ds.config.sem_total_vocab = train_ds.config.sem_total_vocab
+        test_ds.config.sem_total_vocab = train_ds.config.sem_total_vocab
 
     if dist.is_available() and dist.is_initialized():
         # 分布式模式
         train_sampler = DistributedSampler(train_ds, shuffle=True)
         val_sampler = DistributedSampler(val_ds, shuffle=False)
+        test_sampler = DistributedSampler(test_ds, shuffle=False)
     else:
         # 单卡模式
         train_sampler = None
         val_sampler = None
+        test_sampler = None
 
     train_dl = DataLoader(train_ds, batch_size=config.train_batch_size, sampler=train_sampler, num_workers=config.num_workers)
     val_dl = DataLoader(val_ds, batch_size=config.eval_batch_size, sampler=val_sampler, num_workers=config.num_workers)
+    test_dl = DataLoader(test_ds, batch_size=config.eval_batch_size, sampler=val_sampler, num_workers=config.num_workers)
 
-    return train_dl, val_dl
+    return train_dl, val_dl, test_dl

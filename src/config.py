@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import List
 import torch
-from .hstu_preset_config import HSTUPreset
+from .hstu_preset_config import *
 
 @dataclass
 class UniGCRConfig:
@@ -11,7 +11,9 @@ class UniGCRConfig:
     use_atomic_seq: bool = False      # 是否使用 Atomic ID
     use_cat_profile: bool = True      # 是否使用类别用户画像
     use_num_profile: bool = True      # 是否使用数值用户画像
-    
+    use_hstu_config: bool = True
+    hstu_preset_name: str = "HSTU_BOOKS_N512_Mini"  # 选项见 hstu_preset_config.py
+
     # --- [CTR 模块微调] ---
     ctr_use_self_attn: bool = True    # Candidate-Aware Self-Attention
     ctr_use_cross_attn: bool = True   # User-Centric Cross-Attention
@@ -53,7 +55,7 @@ class UniGCRConfig:
 
     # ===== Eval strategy =====
     eval_batch_size: int = 128 #default 64
-    eval_interval: int = 50        # 每 N 个 epoch 才做 ranking eval
+    eval_interval: int = 2        # 每 N 个 epoch 才做 ranking eval
     eval_with_ranking: bool = True
 
     # --- [Uni-GCR Loss] ---
@@ -79,3 +81,21 @@ def apply_hstu_preset(conf, preset: HSTUPreset):
     conf.epochs = preset.epochs
     conf.head_dim = preset.head_dim
     conf.qk_dim = preset.qk_dim
+
+def apply_preset_by_name(conf):
+    preset_dict = {
+        "HSTU_BOOKS_N512": HSTU_BOOKS_N512,
+        "HSTU_BOOKS_N512_LARGE": HSTU_BOOKS_N512_LARGE,
+        "HSTU_BOOKS_N512_Mini": HSTU_BOOKS_N512_Mini,
+        "UniGCR": UniGCR,
+        "test": test,
+    }
+
+    if conf.hstu_preset_name not in preset_dict:
+        raise ValueError(
+            f"Unknown preset: {conf.hstu_preset_name}. "
+            f"Available: {list(preset_dict.keys())}"
+        )
+
+    preset = preset_dict[conf.hstu_preset_name]
+    apply_hstu_preset(conf, preset)
