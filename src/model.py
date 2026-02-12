@@ -221,8 +221,8 @@ class UniGCRModel(nn.Module):
             embedding_dim=config.embed_dim,
             num_blocks=config.hstu_layers,
             num_heads=config.hstu_heads,
-            linear_dim=config.embed_dim,      # 对应 hstu.py 的 linear_dim (dv)
-            attention_dim=config.embed_dim,   # 对应 hstu.py 的 attention_dim (dqk)
+            linear_dim=config.head_dim,      # 对应 hstu.py 的 linear_dim (dv)
+            attention_dim=config.qk_dim,   # 对应 hstu.py 的 attention_dim (dqk)
             normalization="rel_bias",
             linear_config="uvqk",
             linear_activation="silu",

@@ -6,6 +6,8 @@ import json
 import numpy as np
 from .utils import is_main_process
 import math
+import wandb
+
 
 def compute_gr_metrics(candidates, target_items, grid_mapper, topk):
     """
@@ -216,10 +218,7 @@ class UniGCRTrainer:
         }
 
     @torch.no_grad()
-    def evaluate(self, topk=10, with_ranking=True):
-        """
-        完整的评估逻辑：Beam Search 生成 -> Item 还原 -> 指标计算
-        """
+    def evaluate(self, topk=[5, 10], with_ranking=True):
         """
         评估逻辑：
         1. 计算 Validation Loss (GR & CTR) -> 用于 Early Stop
@@ -228,26 +227,29 @@ class UniGCRTrainer:
         if not self.val_loader: return {}
         
         self.model_engine.eval()
-        # device = self.model_engine.device
         device = self.device
         grid_mapper = self.val_loader.dataset.grid_mapper
-        
+
+        gr_metrics = {
+            k: {'hit': 0.0, 'ndcg': 0.0}
+            for k in topk
+        }
+
         # 统计变量 (用于 Loss 计算)
         val_gr_loss_sum = 0.0
         val_ctr_loss_sum = 0.0
         
-        # 统计变量 (用于 Metrics 计算)
-        # GR
-        all_hit_sums = 0.0
-        all_ndcg_sums = 0.0
+        # # 统计变量 (用于 Metrics 计算)
+        # # GR
+        # all_hit_sums = 0.0
+        # all_ndcg_sums = 0.0
         all_gr_count = 0
-        
+        #
         # CTR (收集 Logits 和 Labels 计算全局 AUC)
         all_ctr_logits = []
         all_ctr_labels = []
 
         iterator = tqdm(self.val_loader, desc="Eval") if is_main_process() else self.val_loader
-        # real_model = self.model_engine.module if hasattr(self.model_engine, 'module') else self.model_engine
         real_model = self.model
 
         for batch in iterator:
@@ -284,94 +286,86 @@ class UniGCRTrainer:
             # --- B. 计算 GR Ranking Metrics (Hit/NDCG) ---
             if with_ranking:
                 # 这部分需要 Beam Search 生成，比较耗时
-                # 如果只为了 Early Stop (Loss based)，可以跳过这步，但为了监控指标还是加上
-
-                # 使用纯净的 history 进行 beam search
-                # 构造一个干净的 batch_dict 用于生成
                 eval_batch = {'sem_history': batch['sem_history_eval']}
                 lengths_eval = (eval_batch['sem_history'] != 0).sum(dim=1)
 
                 candidates = real_model.generate_gr_candidates(
                     batch_dict=eval_batch,
-                    beam_width=topk,
+                    beam_width=max(topk),
                     grid_mapper=grid_mapper,
                     lengths=lengths_eval,
                 )
 
-                batch_hit, batch_ndcg = compute_gr_metrics(candidates, batch['target_item'], grid_mapper, topk)
-                all_hit_sums += batch_hit * batch['sem_target_eval'].size(0)
-                all_ndcg_sums += batch_ndcg * batch['sem_target_eval'].size(0)
-                all_gr_count += batch['sem_target_eval'].size(0)
+                batch_size = eval_batch['sem_history'].size(0)
+                for k in topk:
+                    batch_hit, batch_ndcg = compute_gr_metrics(candidates[:, :k, :], batch['target_item'], grid_mapper, k)
+
+                    gr_metrics[k]['hit'] += batch_hit * batch_size
+                    gr_metrics[k]['ndcg'] += batch_ndcg * batch_size
+
+                all_gr_count += batch_size
+
 
         # # --- 汇总结果 ---
         num_batches = len(self.val_loader)
 
-        # 1. Loss 汇总 (Mean across batches)
-        # 简单平均即可，不需要 gather (因为 DP 每个卡数据量差不多)
         avg_gr_loss = val_gr_loss_sum / num_batches
         avg_ctr_loss = val_ctr_loss_sum / num_batches
 
-        # 2. GR Metrics 汇总 (AllReduce)
-        # 转 Tensor
-        # gr_stats = torch.tensor([all_hit_sums, all_ndcg_sums, all_gr_count], device=device)
-        # torch.distributed.all_reduce(gr_stats, op=torch.distributed.ReduceOp.SUM)
-        #
-        # final_hit = gr_stats[0] / gr_stats[2] if gr_stats[2] > 0 else 0.0
-        # final_ndcg = gr_stats[1] / gr_stats[2] if gr_stats[2] > 0 else 0.0
-
-        # --- 汇总 GR ranking metrics（如果你真的算了的话） ---
-        final_hit = 0.0
-        final_ndcg = 0.0
+        results = {'val_gr_loss': avg_gr_loss}
 
         if all_gr_count > 0:
-            final_hit = all_hit_sums / all_gr_count
-            final_ndcg = all_ndcg_sums / all_gr_count
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                for k in topk:
+                    stats = torch.tensor(
+                        [
+                            gr_metrics[k]['hit'],
+                            gr_metrics[k]['ndcg'],
+                            all_gr_count
+                        ],
+                        device=device
+                    )
+                    torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
 
-        # 只有在分布式已初始化时，才需要 all_reduce 汇总
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            gr_stats = torch.tensor([all_hit_sums, all_ndcg_sums, all_gr_count], device=device)
-            torch.distributed.all_reduce(gr_stats, op=torch.distributed.ReduceOp.SUM)
-            final_hit = (gr_stats[0] / gr_stats[2]).item() if gr_stats[2] > 0 else 0.0
-            final_ndcg = (gr_stats[1] / gr_stats[2]).item() if gr_stats[2] > 0 else 0.0
-        else:
-            final_hit = float(final_hit)
-            final_ndcg = float(final_ndcg)
+                    results[f'Hit@{k}'] = (stats[0] / stats[2]).item()
+                    results[f'NDCG@{k}'] = (stats[1] / stats[2]).item()
 
-        results = {
-            'val_gr_loss': avg_gr_loss,
-            'Hit@10': final_hit,
-            'NDCG@10': final_ndcg
-        }
+            else:
+                for k in topk:
+                    results[f'Hit@{k}'] = gr_metrics[k]['hit'] / all_gr_count
+                    results[f'NDCG@{k}'] = gr_metrics[k]['ndcg'] / all_gr_count
 
         if is_main_process():
-            import wandb
-            wandb.log({
-                'val/gr_loss': avg_gr_loss,
-                'val/Hit@10': final_hit,
-                'val/NDCG@10': final_ndcg,
-            }, step=self.current_epoch)
+            log_dict = {'val/gr_loss': avg_gr_loss}
+            for k in topk:
+                log_dict[f'val/Hit@{k}'] = results.get(f'Hit@{k}', 0.0)
+                log_dict[f'val/NDCG@{k}'] = results.get(f'NDCG@{k}', 0.0)
 
-        # 3. CTR Metrics 汇总 (Gather & Sklearn)
+            wandb.log(log_dict, step=self.current_epoch)
+
+        # --------- CTR Metrics ---------
         if self.config.enable_ctr and len(all_ctr_logits) > 0:
+
             local_logits = torch.cat(all_ctr_logits)
             local_labels = torch.cat(all_ctr_labels)
-            
-            # Gather 全局数据算 AUC 才准确
+
             global_logits = gather_tensors(local_logits)
             global_labels = gather_tensors(local_labels)
-            
+
             results['val_ctr_loss'] = avg_ctr_loss
-            
+
             if is_main_process():
                 auc, logloss = compute_ctr_metrics(global_logits, global_labels)
+
                 results['AUC'] = auc
                 results['LogLoss'] = logloss
+
                 wandb.log({
                     'val/ctr_loss': avg_ctr_loss,
                     'val/AUC': auc,
                     'val/LogLoss': logloss,
-                })
-        
+                }, step=self.current_epoch)
+
         return results
 
     def save(self, tag):
@@ -417,12 +411,10 @@ class UniGCRTrainer:
             
             # 2. Eval
             if epoch % self.config.eval_interval == 0:
-                eval_metrics = self.evaluate(topk=10, with_ranking=True)
+                eval_metrics = self.evaluate(topk=[5, 10], with_ranking=True)
             else:
-                eval_metrics = self.evaluate(topk=10, with_ranking=False)
+                eval_metrics = self.evaluate(topk=[5, 10], with_ranking=False)
 
-            # eval_metrics = self.evaluate(topk=10)
-            
             # 3. Logging & Early Stop Logic
             if is_main_process():
 

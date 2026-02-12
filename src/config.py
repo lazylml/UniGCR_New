@@ -1,14 +1,7 @@
 from dataclasses import dataclass, field
 from typing import List
 import torch
-
-try:
-    from generative_recommenders.modeling.sequential.hstu import HSTUConfig
-except ImportError:
-    try:
-        from research_hstu.modeling.sequential.hstu import HSTUConfig
-    except ImportError:
-        HSTUConfig = None
+from .hstu_preset_config import HSTUPreset
 
 @dataclass
 class UniGCRConfig:
@@ -27,7 +20,7 @@ class UniGCRConfig:
     sem_id_layers: int = 3
     sem_id_codebook_size: int = 256
     grid_mapping_path: str = "data/beauty/semantic_ids.json"
-    
+
     # --- [Atomic ID] ---
     num_atomic_items: int = 0
     max_atomic_len: int = 50
@@ -45,8 +38,10 @@ class UniGCRConfig:
     hstu_layers: int = 4 # default 2
     hstu_heads: int = 4 # default 2
     dropout: float = 0.5
-    attn_alpha: float = 1.0
-    
+    attn_alpha: float = 1.7
+    head_dim: int = 16  # 对应 dv
+    qk_dim: int = 16  # 对应 dqk
+
     # --- [训练参数] ---
     patience: int = 3
     train_batch_size: int = 128 #default 64
@@ -69,20 +64,17 @@ class UniGCRConfig:
     
     # --- [运行时动态填充] ---
     sem_total_vocab: int = 0
-    
-    def to_hstu_config(self):
-        if HSTUConfig is None:
-            raise ImportError("generative_recommenders not installed.")
-        return HSTUConfig(
-            embedding_dim=self.embed_dim,
-            num_heads=self.hstu_heads,
-            num_blocks=self.hstu_layers,
-            dropout_rate=self.dropout,
-            linear_dropout_rate=0.0,
-            attn_dropout_rate=0.0,
-            forward_dropout_rate=self.dropout,
-            normalization="layer_norm",
-            activation="silu",
-            max_seq_len=self.max_seq_len,
-            attn_alpha=self.attn_alpha
-        )
+
+
+def apply_hstu_preset(conf, preset: HSTUPreset):
+    conf.embed_dim = preset.embed_dim
+    conf.hstu_layers = preset.hstu_layers
+    conf.hstu_heads = preset.hstu_heads
+    conf.dropout = preset.dropout
+    conf.max_seq_len = preset.max_seq_len
+    conf.train_batch_size = preset.train_batch_size
+    conf.eval_batch_size = preset.eval_batch_size
+    conf.lr = preset.lr
+    conf.epochs = preset.epochs
+    conf.head_dim = preset.head_dim
+    conf.qk_dim = preset.qk_dim

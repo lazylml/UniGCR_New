@@ -3,7 +3,8 @@ import os
 import argparse
 import torch
 import torch.nn as nn
-from src.config import UniGCRConfig
+from src.config import UniGCRConfig, apply_hstu_preset
+from src.hstu_preset_config import HSTU_BOOKS_N512
 from src.data import get_dataloaders
 from src.model import UniGCRModel
 from src.trainer import UniGCRTrainer
@@ -35,6 +36,7 @@ def main():
 
     # 2. 初始化配置
     conf = UniGCRConfig()
+    apply_hstu_preset(conf, HSTU_BOOKS_N512)
 
     # --- [GR-ONLY 核心配置] ---
     conf.enable_ctr = False  # 强制关闭 CTR 任务
